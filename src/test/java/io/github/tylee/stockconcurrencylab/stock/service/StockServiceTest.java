@@ -25,6 +25,9 @@ class StockServiceTest {
     private SynchronizedStockService synchronizedStockService;
 
     @Autowired
+    private PessimisticLockStockService pessimisticLockStockService;
+
+    @Autowired
     private StockRepository stockRepository;
 
     private Long stockId;
@@ -108,6 +111,35 @@ class StockServiceTest {
 
         // synchronized 덕분에 한 번에 하나의 스레드만 decrease를 실행하므로
         // 100번 차감 후 최종 재고는 정확히 0이어야 한다
+        assertEquals(0L, result.getQuantity());
+    }
+
+    @Test
+    void concurrentRequests_pessimisticLock_stockIsZero() throws InterruptedException {
+        int threadCount = 100;
+
+        // 동일한 구조의 스레드 풀과 래치를 사용하되, 비관적 락 서비스를 호출한다
+        ExecutorService executorService = Executors.newFixedThreadPool(32);
+        CountDownLatch latch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            executorService.submit(() -> {
+                try {
+                    pessimisticLockStockService.decrease(stockId, 1L);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        latch.await();
+        executorService.shutdown();
+
+        Stock result = stockRepository.findById(stockId).orElseThrow();
+        System.out.println("final stock (pessimistic lock): " + result.getQuantity());
+
+        // SELECT ... FOR UPDATE로 행이 잠기므로 트랜잭션이 끝날 때까지
+        // 다른 스레드가 대기하고, 100번 차감 후 최종 재고는 정확히 0이어야 한다
         assertEquals(0L, result.getQuantity());
     }
 }
