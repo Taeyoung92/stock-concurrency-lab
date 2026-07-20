@@ -80,9 +80,32 @@ private Long version;
 ```
 
 - DB 락 없이 `@Version` 필드로 충돌을 감지
-- 저장 시 버전이 다르면 `OptimisticLockException` 발생 → 재시도
+- 저장 시 버전이 다르면 `ObjectOptimisticLockingFailureException` 발생
 - **장점**: 충돌이 적은 환경에서 성능 좋음
 - **단점**: 충돌이 잦으면 재시도 로직이 복잡해지고 성능 저하
+
+`OptimisticLockStockService`는 충돌 시 예외를 던지고 끝나므로, 트랜잭션 밖에 있는 `OptimisticLockStockFacade`가 예외를 잡아 짧게 대기(`Thread.sleep(50)`)한 뒤 새 트랜잭션으로 재시도한다.
+
+```java
+public void decrease(Long id, Long quantity) throws InterruptedException {
+    while (true) {
+        try {
+            optimisticLockStockService.decrease(id, quantity);
+            break;
+        } catch (ObjectOptimisticLockingFailureException e) {
+            Thread.sleep(50);
+        }
+    }
+}
+```
+
+## 세 가지 락 방식 비교
+
+| 방식 | 잠금 주체 | 충돌 처리 | 장점 | 단점 |
+|------|-----------|-----------|------|------|
+| synchronized | JVM (객체 모니터) | 한 번에 하나의 스레드만 진입 허용 | 구현이 간단하고 별도 DB 설정 불필요 | 분산 환경(서버 2대 이상)에서는 효과 없음 |
+| 비관적 락 | DB (`SELECT ... FOR UPDATE`) | 락을 잡고 다른 트랜잭션을 대기시킴 | 여러 서버에서도 동작, 충돌이 잦아도 안전 | 락 대기로 인한 성능 저하, 데드락 가능성 |
+| 낙관적 락 | 애플리케이션 (`@Version`) | 커밋 시점에 버전 비교, 충돌 시 예외 → 재시도 | DB 락이 없어 충돌이 적을 때 성능이 가장 좋음 | 충돌이 잦으면 재시도 비용 증가, 재시도 로직을 직접 구현해야 함 |
 
 ## 테스트 방식
 
@@ -107,6 +130,21 @@ latch.await(); // 모든 스레드 완료 대기
 
 - **락 없음**: `assertNotEquals(0, quantity)` → 통과 (문제 발생 확인)
 - **락 적용 후**: `assertEquals(0, quantity)` → 통과 (정합성 보장 확인)
+
+## 테스트 결과
+
+초기 재고 100개, 100개 스레드(스레드 풀 크기 32)로 1개씩 동시 차감했을 때의 실측 결과다.
+
+| 방식 | 차감 후 재고 | 결과 | 소요 시간 |
+|------|--------------|------|-----------|
+| 락 없음 | 90 (예시, 실행마다 달라짐) | ❌ Lost Update 발생 | 0.087s |
+| synchronized | 0 | ✅ 정합성 보장 | 0.69s |
+| 비관적 락 | 0 | ✅ 정합성 보장 | 0.392s |
+| 낙관적 락 | 0 | ✅ 정합성 보장 (재시도 포함) | 1.585s |
+
+- 락 없음: 100번 차감했지만 동시 접근으로 일부 갱신이 유실되어 재고가 0보다 크게 남는다. 유실되는 개수는 스레드 스케줄링에 따라 실행마다 달라진다.
+- synchronized / 비관적 락 / 낙관적 락: 모두 재고가 정확히 0이 되어 정합성이 보장됨을 확인했다.
+- 소요 시간은 로컬 1회 실행 기준이라 벤치마크로 보기는 어렵지만, 낙관적 락은 버전 충돌 시 `Thread.sleep(50)` 후 재시도하는 구조라 충돌이 잦은 이 테스트(스레드 100개가 같은 행 하나를 동시에 갱신)에서는 다른 방식보다 느리게 나타났다.
 
 ## 기술 스택
 
